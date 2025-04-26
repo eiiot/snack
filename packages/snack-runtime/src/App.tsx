@@ -16,7 +16,6 @@ import { parseRuntimeUrl } from 'snack-content/build/urls'; // NOTE(cedric): thi
 import { createVirtualModulePath } from 'snack-require-context';
 
 import { AppLoading } from './AppLoading';
-import BarCodeScannerView from './BarCodeScannerView';
 import * as Console from './Console';
 import { SNACK_API_URL } from './Constants';
 import * as Errors from './Errors';
@@ -50,7 +49,7 @@ type Props = {
    * @example exp://exp.host/@bycedric/great-bagel+REEOUkskIw
    * @example https://exp.host/@bycedric/great-pancake
    */
-  snackUrl?: string;
+  snackUrl: string;
 
   /**
    * Callback for when the Snack wants to reload the current URL.
@@ -66,10 +65,8 @@ type Props = {
 
 type State = {
   initialLoad: boolean;
-  initialURL: string;
   showSplash: boolean;
   isLoading: boolean;
-  showBarCodeScanner: boolean;
   rootElement: React.ReactElement | null;
   channel: string | null;
   snackIdentifier: string | null;
@@ -79,7 +76,6 @@ type State = {
 };
 
 const RELOAD_URL_KEY = 'snack-reload-url';
-const ONE_MINUTE = 1000 * 60;
 
 // Last known Snack state workaround, the App component is too big to incorporate the state updates
 let prevSnackState: SnackState;
@@ -97,10 +93,8 @@ export default class App extends React.Component<Props, State> {
 
   state: State = {
     initialLoad: true,
-    initialURL: '',
     showSplash: Platform.OS !== 'web',
     isLoading: true,
-    showBarCodeScanner: false,
     rootElement: null, // Root React element produced by the user's application
     channel: null,
     snackIdentifier: null,
@@ -114,14 +108,13 @@ export default class App extends React.Component<Props, State> {
   async componentDidMount() {
     Profiling.checkpoint('`App.componentDidMount()` start');
 
-    let initialURL: string | null =
-      this.props.snackUrl ?? EXDevLauncher.manifestURL ?? (await Linking.getInitialURL());
+    const initialURL: string = this.props.snackUrl;
 
     // Generate unique device-id
     const deviceId = await getDeviceIdAsync();
 
     // Initialize messaging transport
-    const testTransport = initialURL ? parseTestTransportFromUrl(initialURL) : null;
+    const testTransport = parseTestTransportFromUrl(initialURL);
     Messaging.init(deviceId, testTransport);
 
     // Initialize various things
@@ -159,51 +152,16 @@ export default class App extends React.Component<Props, State> {
     try {
       // Open from the initial URL if given
 
-      if (!initialURL) {
-        // Check for any stored URLs for reload
-        const result = JSON.parse((await AsyncStorage.getItem(RELOAD_URL_KEY)) ?? '{}');
-        if (result?.url) {
-          // Remove the stored URL so next refresh can start fresh
-          // For example, in development, we want the barcode scanner
-          await AsyncStorage.removeItem(RELOAD_URL_KEY);
+      Logger.info('Found initial URL', initialURL);
 
-          // If there is no initial URL, check if the stored URL is new
-          // We discard if it's older than 15 mins
-          // 15 mins is probably too long, but it doesn't really matter
-          // since initial URL will only be empty during development and reload
-          if (Date.now() - result.timestamp < ONE_MINUTE * 15) {
-            Logger.info('Found reload URL', result.url);
-
-            initialURL = result.url;
-          } else {
-            Logger.info('Found reload URL, but it was expired', result.url);
-          }
-        }
-      } else {
-        Logger.info('Found initial URL', initialURL);
-      }
-
-      if (initialURL) {
-        this._openUrl(initialURL);
-      }
+      this._openUrl(initialURL);
     } catch (e) {
       Logger.error('An error occurred when getting URL', e);
     }
 
-    if (!this._currentUrl) {
-      if (!Files.get(Files.entry())) {
-        // Else show the barcode scanner
-        // eslint-disable-next-line react/no-did-mount-set-state
-        this.setState(() => ({
-          showSplash: false,
-          showBarCodeScanner: true,
-          initialURL: initialURL ?? '',
-        }));
-      }
-    } else {
-      // eslint-disable-next-line react/no-did-mount-set-state
-      this.setState(() => ({ showSplash: false }));
-    }
+    this.setState(() => ({
+      showSplash: false,
+    }));
 
     this.subscriptions = [
       Linking.addEventListener('url', this._handleOpenUrl),
@@ -225,19 +183,6 @@ export default class App extends React.Component<Props, State> {
     }
   };
 
-  // `BarCodeScannerView` read a URL, try to open it
-  _handleBarCodeRead = ({ data }: { data: string }) => {
-    Logger.info('Scanned barcode', data);
-
-    try {
-      if (this._openUrl(data)) {
-        this.setState({ showBarCodeScanner: false });
-      }
-    } catch (e) {
-      Logger.error(e);
-    }
-  };
-
   _handleAppStateChange = (
     appState: 'active' | 'inactive' | 'background' | 'unknown' | 'extension',
   ) => {
@@ -254,8 +199,6 @@ export default class App extends React.Component<Props, State> {
         if (channel) {
           Messaging.subscribe({ channel });
           this._askForCode();
-        } else if (!Files.get(Files.entry())) {
-          this.setState({ showBarCodeScanner: true });
         }
       } else {
         this._cancelAskForCode();
@@ -264,7 +207,7 @@ export default class App extends React.Component<Props, State> {
     }
   };
 
-  _currentUrl?: string;
+  _currentUrl: string;
 
   // Open Snack session at given `url`, throw if bad URL or couldn't connect. All we need to do is
   // subscribe to the associated messaging channel, everything else is triggered by messages.
@@ -282,7 +225,6 @@ export default class App extends React.Component<Props, State> {
       this.setState({
         channel,
         snackIdentifier: null, // TODO: Use proper Snack identifier when available
-        initialURL: url,
       });
 
       Profiling.checkpoint('`_openUrl()` read');
@@ -302,7 +244,6 @@ export default class App extends React.Component<Props, State> {
       this.setState({
         channel: null,
         snackIdentifier: snack,
-        initialURL: url,
       });
 
       Messaging.unsubscribe();
@@ -333,37 +274,6 @@ export default class App extends React.Component<Props, State> {
     notifyStateChange(this.props, 'error');
 
     return false;
-  };
-
-  _handleReloadSnack = async () => {
-    const url = this._currentUrl;
-    if (url) {
-      Logger.info('Reloading app with URL', url);
-
-      // On iOS, closing the app may not trigger unsubscribe
-      // So we explicitly unsubscribe before reloading
-      Messaging.unsubscribe();
-
-      if (Platform.OS === 'ios') {
-        // If we immediately reload, unsubscription message isn't sent yet
-        // Add this timeout to make sure that it is
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-
-      // Store the current URL and timestamp in asyncstorage
-      // When the app reloads, it can read the stored URL to open the snack
-      await AsyncStorage.setItem(
-        RELOAD_URL_KEY,
-        JSON.stringify({
-          url,
-          timestamp: Date.now(),
-        }),
-      );
-
-      await this.props.onSnackReload?.();
-    } else {
-      Logger.info("Got a reload request, but we don't have a URL");
-    }
   };
 
   // @ts-ignore: NodeJS.Timeout not defined?
@@ -463,7 +373,6 @@ export default class App extends React.Component<Props, State> {
           break;
         }
         case 'RELOAD_SNACK':
-          this._handleReloadSnack();
           break;
       }
     });
@@ -595,28 +504,11 @@ export default class App extends React.Component<Props, State> {
   }
 
   render() {
-    const {
-      showSplash,
-      showBarCodeScanner,
-      rootElement,
-      loadingElement,
-      initialLoad,
-      initialURL,
-      isConnected,
-      isLoading,
-    } = this.state;
+    const { showSplash, rootElement, loadingElement, initialLoad, isConnected, isLoading } =
+      this.state;
 
     if (showSplash) {
       return <AppLoading />;
-    }
-
-    if (showBarCodeScanner) {
-      return (
-        <>
-          <StatusBar style="dark" />
-          <BarCodeScannerView onBarCodeScanned={this._handleBarCodeRead} initialURL={initialURL} />
-        </>
-      );
     }
 
     // Render root element of the user's application if present, else a loading view. In
