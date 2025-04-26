@@ -1,17 +1,9 @@
 import './polyfill';
 
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { activateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
 import * as React from 'react';
-import {
-  AppState,
-  PixelRatio,
-  Dimensions,
-  Platform,
-  EmitterSubscription,
-  NativeEventSubscription,
-} from 'react-native';
+import { PixelRatio, Dimensions, Platform } from 'react-native';
 import { parseRuntimeUrl } from 'snack-content/build/urls'; // NOTE(cedric): this is a workaround as 'snack-content/build/sdk' causes Hermes syntax crashes
 import { createVirtualModulePath } from 'snack-require-context';
 
@@ -24,9 +16,7 @@ import LoadingView from './LoadingView';
 import * as Logger from './Logger';
 import * as Messaging from './Messaging';
 import * as Modules from './Modules';
-import EXDevLauncher from './NativeModules/EXDevLauncher';
 import { isExpoRouterEntry } from './NativeModules/ExpoRouter';
-import Linking from './NativeModules/Linking';
 import { captureRef as takeSnapshotAsync } from './NativeModules/ViewShot';
 import getDeviceIdAsync from './NativeModules/getDeviceIdAsync';
 import * as Profiling from './Profiling';
@@ -52,12 +42,6 @@ type Props = {
   snackUrl: string;
 
   /**
-   * Callback for when the Snack wants to reload the current URL.
-   * This is invoked by the "reload now" button on the Snack website.
-   */
-  onSnackReload?: () => Promise<any>;
-
-  /**
    * Callback for Snack state changes, like "loading" or "finished".
    */
   onSnackState?: (state: SnackState) => any;
@@ -74,8 +58,6 @@ type State = {
   isConnected: boolean;
   loadingElement: React.ReactNode;
 };
-
-const RELOAD_URL_KEY = 'snack-reload-url';
 
 // Last known Snack state workaround, the App component is too big to incorporate the state updates
 let prevSnackState: SnackState;
@@ -103,18 +85,16 @@ export default class App extends React.Component<Props, State> {
     loadingElement: <LoadingView />,
   };
 
-  private subscriptions: (EmitterSubscription | NativeEventSubscription)[] = [];
-
   async componentDidMount() {
     Profiling.checkpoint('`App.componentDidMount()` start');
 
-    const initialURL: string = this.props.snackUrl;
+    const url: string = this.props.snackUrl;
 
     // Generate unique device-id
     const deviceId = await getDeviceIdAsync();
 
     // Initialize messaging transport
-    const testTransport = parseTestTransportFromUrl(initialURL);
+    const testTransport = parseTestTransportFromUrl(url);
     Messaging.init(deviceId, testTransport);
 
     // Initialize various things
@@ -152,9 +132,9 @@ export default class App extends React.Component<Props, State> {
     try {
       // Open from the initial URL if given
 
-      Logger.info('Found initial URL', initialURL);
+      Logger.info('Found initial URL', url);
 
-      this._openUrl(initialURL);
+      this._openUrl(url);
     } catch (e) {
       Logger.error('An error occurred when getting URL', e);
     }
@@ -162,50 +142,12 @@ export default class App extends React.Component<Props, State> {
     this.setState(() => ({
       showSplash: false,
     }));
-
-    this.subscriptions = [
-      Linking.addEventListener('url', this._handleOpenUrl),
-      AppState.addEventListener('change', this._handleAppStateChange),
-    ];
   }
 
-  componentWillUnmount() {
-    this.subscriptions?.forEach((subscription) => subscription.remove());
-  }
+  componentWillUnmount() {}
 
   _view?: Errors.ErrorBoundary | null;
   _awaitingModulesInitialization?: Promise<void>;
-
-  _handleOpenUrl = async (data: { url: string }) => {
-    if (data.url) {
-      Logger.info('URL changed', data.url);
-      this._openUrl(data.url);
-    }
-  };
-
-  _handleAppStateChange = (
-    appState: 'active' | 'inactive' | 'background' | 'unknown' | 'extension',
-  ) => {
-    const foreground = appState === 'active';
-
-    if (this.state.foreground !== foreground) {
-      Logger.info('App state changed to', appState);
-
-      this.setState({ foreground });
-
-      if (foreground) {
-        const { channel } = this.state;
-
-        if (channel) {
-          Messaging.subscribe({ channel });
-          this._askForCode();
-        }
-      } else {
-        this._cancelAskForCode();
-        Messaging.unsubscribe();
-      }
-    }
-  };
 
   _currentUrl: string;
 
@@ -217,10 +159,11 @@ export default class App extends React.Component<Props, State> {
 
     // Connect to the Snack website session, if the URL contains a channel or session ID
     const { channel, snack } = parseRuntimeUrl(url) ?? {};
+
     if (channel) {
       this._currentUrl = url;
 
-      Logger.info('Opening Snack session', url);
+      Logger.info('Opening Snack session THIS IS A TEST', url);
 
       this.setState({
         channel,
@@ -230,7 +173,7 @@ export default class App extends React.Component<Props, State> {
       Profiling.checkpoint('`_openUrl()` read');
 
       Messaging.subscribe({ channel });
-      this._askForCode();
+      Messaging.publish({ type: 'RESEND_CODE' });
 
       return true;
     }
@@ -276,51 +219,6 @@ export default class App extends React.Component<Props, State> {
     return false;
   };
 
-  // @ts-ignore: NodeJS.Timeout not defined?
-  _askTimeout?: NodeJS.Timeout;
-
-  _askForCode = () => {
-    let time = 3 * 1000;
-
-    this._cancelAskForCode();
-
-    const ask = () => {
-      if (this.state.initialLoad) {
-        time = time * 1.2;
-        this._askTimeout = setTimeout(ask, time);
-        Messaging.publish({ type: 'RESEND_CODE' });
-      }
-    };
-
-    this._askTimeout = setTimeout(ask, time);
-
-    Messaging.publish({ type: 'RESEND_CODE' });
-  };
-
-  _cancelAskForCode = () => {
-    if (this._askTimeout) {
-      clearTimeout(this._askTimeout);
-      this._askTimeout = undefined;
-    }
-  };
-
-  _uploadPreviewToS3 = async (asset: string, height: number, width: number) => {
-    const url = `${SNACK_API_URL}/--/api/v2/snack/uploadPreview`;
-    const body = JSON.stringify({ asset, height, width });
-    try {
-      Logger.info('Uploading preview...', 'width', width, 'height', height);
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-      });
-      const data = await response.json();
-      return data.url;
-    } catch (e) {
-      throw new Error('Unable to upload asset to S3: ' + e.message);
-    }
-  };
-
   // Listen for Snack updates
   _listenForUpdates(deviceId: string) {
     Messaging.listen(async ({ message }) => {
@@ -330,9 +228,6 @@ export default class App extends React.Component<Props, State> {
 
       switch (message.type) {
         case 'CODE': {
-          // Stop asking for code if we received it
-          this._cancelAskForCode();
-
           Profiling.checkpoint('`CODE` message recv');
           this._lastCodeUpdatePromise = this._handleCodeUpdate(
             message,
@@ -341,39 +236,6 @@ export default class App extends React.Component<Props, State> {
           );
           break;
         }
-        case 'REQUEST_STATUS': {
-          const pixelRatio = PixelRatio.get();
-          const dims = Dimensions.get('window');
-          const height = dims.height / pixelRatio;
-          const width = dims.width / pixelRatio;
-
-          if (this._view) {
-            let previewLocation = null;
-            try {
-              const snapshot = await takeSnapshotAsync(this._view, {
-                format: 'jpg',
-                quality: 0.4,
-                result: 'base64',
-                height,
-                width,
-                snapshotContentContainer: false,
-              });
-              if (snapshot) {
-                previewLocation = await this._uploadPreviewToS3(snapshot, height, width);
-              }
-            } catch (e) {
-              Logger.error('Failed to record preview', e);
-            }
-            Messaging.publish({
-              type: 'STATUS_REPORT',
-              previewLocation,
-              status: Errors.status(),
-            });
-          }
-          break;
-        }
-        case 'RELOAD_SNACK':
-          break;
       }
     });
   }
