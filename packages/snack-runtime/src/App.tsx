@@ -1,27 +1,19 @@
 import './polyfill';
 
-import { activateKeepAwake } from 'expo-keep-awake';
 import { StatusBar } from 'expo-status-bar';
 import * as React from 'react';
-import { PixelRatio, Dimensions, Platform } from 'react-native';
+import { Platform } from 'react-native';
 import { parseRuntimeUrl } from 'snack-content/build/urls'; // NOTE(cedric): this is a workaround as 'snack-content/build/sdk' causes Hermes syntax crashes
 import { createVirtualModulePath } from 'snack-require-context';
 
 import { AppLoading } from './AppLoading';
-import * as Console from './Console';
-import { SNACK_API_URL } from './Constants';
 import * as Errors from './Errors';
 import * as Files from './Files';
 import LoadingView from './LoadingView';
 import * as Logger from './Logger';
-import * as Messaging from './Messaging';
 import * as Modules from './Modules';
 import { isExpoRouterEntry } from './NativeModules/ExpoRouter';
-import { captureRef as takeSnapshotAsync } from './NativeModules/ViewShot';
-import getDeviceIdAsync from './NativeModules/getDeviceIdAsync';
 import * as Profiling from './Profiling';
-import UpdateIndicator from './UpdateIndicator';
-import { parseTestTransportFromUrl } from './UrlUtils';
 import { SnackRuntimeContext } from './config/SnackConfig';
 import { type SnackApiCode, fetchCodeBySnackIdentifier, SnackApiError } from './utils/ExpoApi';
 
@@ -50,12 +42,9 @@ type Props = {
 type State = {
   initialLoad: boolean;
   showSplash: boolean;
-  isLoading: boolean;
   rootElement: React.ReactElement | null;
-  channel: string | null;
   snackIdentifier: string | null;
   foreground: boolean;
-  isConnected: boolean;
   loadingElement: React.ReactNode;
 };
 
@@ -76,12 +65,9 @@ export default class App extends React.Component<Props, State> {
   state: State = {
     initialLoad: true,
     showSplash: Platform.OS !== 'web',
-    isLoading: true,
     rootElement: null, // Root React element produced by the user's application
-    channel: null,
     snackIdentifier: null,
     foreground: true,
-    isConnected: false,
     loadingElement: <LoadingView />,
   };
 
@@ -90,39 +76,7 @@ export default class App extends React.Component<Props, State> {
 
     const url: string = this.props.snackUrl;
 
-    // Generate unique device-id
-    const deviceId = await getDeviceIdAsync();
-
-    // Initialize messaging transport
-    const testTransport = parseTestTransportFromUrl(url);
-    Messaging.init(deviceId, testTransport);
-
-    // Initialize various things
     this._awaitingModulesInitialization = Modules.initialize(this.context);
-    Console.initialize((method: string, payload: unknown[]) => {
-      // Send any intercepted console.x calls to the sdk.
-      // Errors are made serializable and converted to a string.
-      Messaging.publish({
-        type: 'CONSOLE',
-        method,
-        payload: payload.map((item) => {
-          if (typeof item === 'object') {
-            if (item instanceof Error) {
-              const stack = Errors.prettyStack(item).split('\n', 4).join(' << ');
-              return `Error: "${item.message}" in ${stack}\n...`;
-            }
-            try {
-              return JSON.stringify(item);
-            } catch {}
-          }
-          return String(item);
-        }),
-      });
-    });
-    this._listenForUpdates(deviceId);
-
-    // Keep the device awake so the user doesn't have to keep waking it while coding
-    activateKeepAwake();
 
     // If we have an entry point file already, we can load now
     if (Files.get(Files.entry())) {
@@ -144,12 +98,8 @@ export default class App extends React.Component<Props, State> {
     }));
   }
 
-  componentWillUnmount() {}
-
   _view?: Errors.ErrorBoundary | null;
   _awaitingModulesInitialization?: Promise<void>;
-
-  _currentUrl: string;
 
   // Open Snack session at given `url`, throw if bad URL or couldn't connect. All we need to do is
   // subscribe to the associated messaging channel, everything else is triggered by messages.
@@ -157,40 +107,14 @@ export default class App extends React.Component<Props, State> {
     // Notify the `onSnackState` event callback that a Snack is being loaded
     notifyStateChange(this.props, 'loading');
 
-    // Connect to the Snack website session, if the URL contains a channel or session ID
-    const { channel, snack } = parseRuntimeUrl(url) ?? {};
+    const { snack } = parseRuntimeUrl(url) ?? {};
 
-    if (channel) {
-      this._currentUrl = url;
-
-      Logger.info('Opening Snack session THIS IS A TEST', url);
-
-      this.setState({
-        channel,
-        snackIdentifier: null, // TODO: Use proper Snack identifier when available
-      });
-
-      Profiling.checkpoint('`_openUrl()` read');
-
-      Messaging.subscribe({ channel });
-      Messaging.publish({ type: 'RESEND_CODE' });
-
-      return true;
-    }
-
-    // Load the Snack directly from the API when the URL does not contain a channel or session ID
     if (snack) {
-      this._currentUrl = url;
-
       Logger.info('Opening URL', url);
 
       this.setState({
-        channel: null,
         snackIdentifier: snack,
       });
-
-      Messaging.unsubscribe();
-      Profiling.checkpoint('`_openUrl()` read');
 
       // Load the code in the background, without blocking the UI
       fetchCodeBySnackIdentifier(snack).then((res) => {
@@ -219,56 +143,6 @@ export default class App extends React.Component<Props, State> {
     return false;
   };
 
-  // Listen for Snack updates
-  _listenForUpdates(deviceId: string) {
-    Messaging.listen(async ({ message }) => {
-      Logger.comm_recv('Message received', message);
-
-      this.setState((state) => (!state.isConnected ? { isConnected: true } : null));
-
-      switch (message.type) {
-        case 'CODE': {
-          Profiling.checkpoint('`CODE` message recv');
-          this._lastCodeUpdatePromise = this._handleCodeUpdate(
-            message,
-            this._lastCodeUpdatePromise,
-            deviceId,
-          );
-          break;
-        }
-      }
-    });
-  }
-
-  _lastCodeUpdatePromise = Promise.resolve();
-
-  _handleCodeUpdate = async (message: any, waitForPromise: Promise<any>, deviceId: string) => {
-    await waitForPromise;
-    await Profiling.section(`'CODE' message`, async () => {
-      this.setState(() => ({ isLoading: true }));
-
-      // Update project-level dependency info if given
-      let changedDependencies: string[] = [];
-      if (message.dependencies) {
-        changedDependencies = await Modules.updateProjectDependencies(message.dependencies);
-      }
-
-      // Update local files and reload
-      const changedPaths = await Files.update({ message });
-
-      // Reload modules when anything has changed
-      if (changedDependencies.length || changedPaths.length) {
-        Profiling.checkpoint('`CODE` message `_reloadModules()` begin');
-        await this._reloadModules({ changedPaths, changedDependencies });
-      } else {
-        Logger.warn('Code message received but no changes detected, ignoring');
-        this.setState(() => ({ isLoading: false }));
-      }
-
-      notifyStateChange(this.props, 'finished');
-    });
-  };
-
   _handleCodeFetch = async (response: SnackApiCode | SnackApiError) => {
     if ('errors' in response) {
       // Check if Snack was not found
@@ -279,8 +153,6 @@ export default class App extends React.Component<Props, State> {
     }
 
     await Profiling.section(`Fetched code from API`, async () => {
-      this.setState(() => ({ isLoading: true }));
-
       // Update project-level dependency info if given
       let changedDependencies: string[] = [];
       if (response.dependencies) {
@@ -297,7 +169,6 @@ export default class App extends React.Component<Props, State> {
         await this._reloadModules({ changedPaths, changedDependencies });
       } else {
         Logger.warn('Code message received but no changes detected, ignoring');
-        this.setState(() => ({ isLoading: false }));
       }
 
       notifyStateChange(this.props, 'finished');
@@ -358,7 +229,6 @@ export default class App extends React.Component<Props, State> {
     } finally {
       this.setState((state) => ({
         rootElement: rootElement ?? state.rootElement,
-        isLoading: false,
         initialLoad: false,
         showSplash: false,
       }));
@@ -366,8 +236,7 @@ export default class App extends React.Component<Props, State> {
   }
 
   render() {
-    const { showSplash, rootElement, loadingElement, initialLoad, isConnected, isLoading } =
-      this.state;
+    const { showSplash, rootElement, loadingElement } = this.state;
 
     if (showSplash) {
       return <AppLoading />;
@@ -375,17 +244,12 @@ export default class App extends React.Component<Props, State> {
 
     // Render root element of the user's application if present, else a loading view. In
     // either case, surround by an `ErrorBoundary` to display errors and allow recovery.
-    const isConnecting = !!this._currentUrl && !isConnected && !!this.state.channel; // Only show when Snack is connecting to a channel or session ID
     return (
       <>
         <StatusBar style="dark" />
         <Errors.ErrorBoundary ref={(view) => (this._view = view)}>
           {rootElement ?? loadingElement}
         </Errors.ErrorBoundary>
-        <UpdateIndicator
-          visible={isConnecting || isLoading}
-          label={isConnecting ? 'Connecting…' : initialLoad ? 'Loading…' : 'Updating…'}
-        />
       </>
     );
   }
