@@ -3,7 +3,6 @@ import './polyfill';
 import { StatusBar } from 'expo-status-bar';
 import * as React from 'react';
 import { Platform } from 'react-native';
-import { parseRuntimeUrl } from 'snack-content/build/urls'; // NOTE(cedric): this is a workaround as 'snack-content/build/sdk' causes Hermes syntax crashes
 import { createVirtualModulePath } from 'snack-require-context';
 
 import { AppLoading } from './AppLoading';
@@ -13,9 +12,8 @@ import LoadingView from './LoadingView';
 import * as Logger from './Logger';
 import * as Modules from './Modules';
 import { isExpoRouterEntry } from './NativeModules/ExpoRouter';
-import * as Profiling from './Profiling';
 import { SnackRuntimeContext } from './config/SnackConfig';
-import { type SnackApiCode, fetchCodeBySnackIdentifier, SnackApiError } from './utils/ExpoApi';
+import { type SnackApiCode } from './utils/ExpoApi';
 
 export type SnackState = 'loading' | 'finished' | 'not-found' | 'error';
 
@@ -31,7 +29,7 @@ type Props = {
    * @example exp://exp.host/@bycedric/great-bagel+REEOUkskIw
    * @example https://exp.host/@bycedric/great-pancake
    */
-  snackUrl: string;
+  snackCode: SnackApiCode;
 
   /**
    * Callback for Snack state changes, like "loading" or "finished".
@@ -43,7 +41,6 @@ type State = {
   initialLoad: boolean;
   showSplash: boolean;
   rootElement: React.ReactElement | null;
-  snackIdentifier: string | null;
   foreground: boolean;
   loadingElement: React.ReactNode;
 };
@@ -66,113 +63,46 @@ export default class App extends React.Component<Props, State> {
     initialLoad: true,
     showSplash: Platform.OS !== 'web',
     rootElement: null, // Root React element produced by the user's application
-    snackIdentifier: null,
     foreground: true,
     loadingElement: <LoadingView />,
   };
 
   async componentDidMount() {
-    Profiling.checkpoint('`App.componentDidMount()` start');
-
-    const url: string = this.props.snackUrl;
-
-    this._awaitingModulesInitialization = Modules.initialize(this.context);
+    await Modules.initialize(this.context);
 
     // If we have an entry point file already, we can load now
     if (Files.get(Files.entry())) {
       this._reloadModules();
     }
 
-    try {
-      // Open from the initial URL if given
+    notifyStateChange(this.props, 'loading');
 
-      Logger.info('Found initial URL', url);
-
-      this._openUrl(url);
-    } catch (e) {
-      Logger.error('An error occurred when getting URL', e);
-    }
+    this._handleCodeFetch(this.props.snackCode);
 
     this.setState(() => ({
       showSplash: false,
     }));
   }
 
-  _view?: Errors.ErrorBoundary | null;
-  _awaitingModulesInitialization?: Promise<void>;
-
-  // Open Snack session at given `url`, throw if bad URL or couldn't connect. All we need to do is
-  // subscribe to the associated messaging channel, everything else is triggered by messages.
-  _openUrl = (url: string): boolean => {
-    // Notify the `onSnackState` event callback that a Snack is being loaded
-    notifyStateChange(this.props, 'loading');
-
-    const { snack } = parseRuntimeUrl(url) ?? {};
-
-    if (snack) {
-      Logger.info('Opening URL', url);
-
-      this.setState({
-        snackIdentifier: snack,
-      });
-
-      // Load the code in the background, without blocking the UI
-      fetchCodeBySnackIdentifier(snack).then((res) => {
-        if (res) {
-          this._handleCodeFetch(res);
-        } else {
-          notifyStateChange(this.props, 'error');
-        }
-      });
-
-      return true;
+  _handleCodeFetch = async (response: SnackApiCode) => {
+    // Update project-level dependency info if given
+    let changedDependencies: string[] = [];
+    if (response.dependencies) {
+      changedDependencies = await Modules.updateProjectDependencies(response.dependencies);
     }
 
-    Logger.warn(
-      `Snack URL didn't match any of the following formats:
-        - 'https://exp.host/@snack/SAVE_UUID+CHANNEL_UUID'
-        - 'https://exp.host/@snack/sdk.14.0.0-CHANNEL_UUID'
-        - 'https://exp.host/@snack/SAVE_UUID'
-        - 'https://exp.host/@USERNAME/SNACK_SLUG'
-      `,
-    );
+    // Update local files and reload
+    Files.updateProjectFiles(response.code);
+    const changedPaths = Object.keys(response.code);
 
-    // Notify that a misformed URL being passed, and the Snack can't be loaded
-    notifyStateChange(this.props, 'error');
-
-    return false;
-  };
-
-  _handleCodeFetch = async (response: SnackApiCode | SnackApiError) => {
-    if ('errors' in response) {
-      // Check if Snack was not found
-      if (response.errors.find((error) => error.code === 'SNACK_NOT_FOUND')) {
-        return notifyStateChange(this.props, 'not-found');
-      }
-      return notifyStateChange(this.props, 'error');
+    // Reload modules when anything has changed
+    if (changedDependencies.length || changedPaths.length) {
+      await this._reloadModules({ changedPaths, changedDependencies });
+    } else {
+      Logger.warn('Code message received but no changes detected, ignoring');
     }
 
-    await Profiling.section(`Fetched code from API`, async () => {
-      // Update project-level dependency info if given
-      let changedDependencies: string[] = [];
-      if (response.dependencies) {
-        changedDependencies = await Modules.updateProjectDependencies(response.dependencies);
-      }
-
-      // Update local files and reload
-      await Files.updateProjectFiles(response.code);
-      const changedPaths = Object.keys(response.code);
-
-      // Reload modules when anything has changed
-      if (changedDependencies.length || changedPaths.length) {
-        Profiling.checkpoint('Fetched code from API `_reloadModules()` begin');
-        await this._reloadModules({ changedPaths, changedDependencies });
-      } else {
-        Logger.warn('Code message received but no changes detected, ignoring');
-      }
-
-      notifyStateChange(this.props, 'finished');
-    });
+    notifyStateChange(this.props, 'finished');
   };
 
   // Flush stale modules given local file paths that have changed. If needed, load the root module
@@ -182,10 +112,6 @@ export default class App extends React.Component<Props, State> {
     changedDependencies = [],
   }: { changedPaths?: string[]; changedDependencies?: string[] } = {}) {
     Logger.module('Reloading, files changed', changedPaths.concat(changedDependencies), '...');
-    if (this._awaitingModulesInitialization) {
-      await this._awaitingModulesInitialization;
-      this._awaitingModulesInitialization = undefined;
-    }
 
     let rootElement: React.ReactElement | undefined;
     try {
@@ -247,9 +173,7 @@ export default class App extends React.Component<Props, State> {
     return (
       <>
         <StatusBar style="dark" />
-        <Errors.ErrorBoundary ref={(view) => (this._view = view)}>
-          {rootElement ?? loadingElement}
-        </Errors.ErrorBoundary>
+        <Errors.ErrorBoundary>{rootElement ?? loadingElement}</Errors.ErrorBoundary>
       </>
     );
   }
